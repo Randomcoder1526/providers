@@ -1,0 +1,136 @@
+name: Check Provider URLs
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+  workflow_dispatch:      # Allow manual triggering
+
+# Set explicit permissions for the GITHUB_TOKEN
+permissions:
+  contents: write
+
+jobs:
+  check-urls:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install dependencies
+        run: npm install axios
+
+      - name: Run URL checker
+        id: url_checker
+        shell: bash
+        run: |
+          set -o pipefail
+          # Run the URL checker and show output in the job logs while also saving it
+          node .github/scripts/url-checker.js 2>&1 | tee checker_output.log
+          
+          # Check if there are updated providers
+          if grep -q "### UPDATED_PROVIDERS_START ###" checker_output.log; then
+            echo "CHANGES_DETECTED=true" >> "$GITHUB_ENV"
+            
+            # Extract only the updated provider lines between the markers
+            sed -n '/### UPDATED_PROVIDERS_START ###/,/### UPDATED_PROVIDERS_END ###/p' checker_output.log | \
+              grep -v "###" > updated_providers.txt
+          else
+            echo "CHANGES_DETECTED=false" >> "$GITHUB_ENV"
+          fi
+          
+          echo "--- checker_output.log ---"
+          cat checker_output.log
+          echo "--- end checker_output.log ---"
+      
+      - name: Commit changes if any
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add modflix.json
+          
+          # Check if there are changes using git status
+          if [[ $(git status --porcelain modflix.json) ]]; then
+            echo "Found changes in modflix.json, committing..."
+            git commit -m "Update provider URLs [skip ci]"
+            git push
+            echo "CHANGES_MADE=true" >> $GITHUB_ENV
+          else
+            echo "No changes detected in modflix.json"
+            echo "CHANGES_MADE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Send Discord notification
+        if: env.CHANGES_MADE == 'true' && env.CHANGES_DETECTED == 'true'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "Error: DISCORD_WEBHOOK secret is not set. Skipping notification."
+            exit 0
+          fi
+          
+          # Count updated providers
+          PROVIDER_COUNT=$(wc -l < updated_providers.txt)
+          
+          # Create discord-message.json file with proper formatting
+          cat > discord-message.json << EOF
+          {
+            "embeds": [
+              {
+                "title": "🔄 Provider URLs Updated ($PROVIDER_COUNT)",
+                "color": 3066993,
+                "fields": [
+          EOF
+          
+          # Process each updated provider
+          while IFS='|' read -r name oldUrl newUrl; do
+            # continue if line is empty
+            [[ -z "$name" ]] && continue
+
+            # Escape any double quotes in the values
+            name=$(echo "$name" | sed 's/"/\\"/g')
+            oldUrl=$(echo "$oldUrl" | sed 's/"/\\"/g')
+            newUrl=$(echo "$newUrl" | sed 's/"/\\"/g')
+            
+            # Add the provider as a field with clickable links using <URL> syntax
+            cat >> discord-message.json << EOF
+                  {
+                    "name": "${name}",
+                    "value": "**Old:** <${oldUrl}>\\n**New:** <${newUrl}>",
+                    "inline": false
+                  },
+          EOF
+          done < updated_providers.txt
+          
+          # Remove the trailing comma from the last field
+          sed -i '$ s/,$//' discord-message.json
+          
+          # Complete the JSON structure
+          cat >> discord-message.json << EOF
+                ],
+                "footer": {
+                  "text": "Updated on $(date +"%Y-%m-%d %H:%M:%S UTC")"
+                }
+              }
+            ]
+          }
+          EOF
+          
+          # Send the webhook
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d @discord-message.json \
+            "$DISCORD_WEBHOOK"
+          
+          # Check if the webhook was sent successfully
+          if [ $? -eq 0 ]; then
+            echo "Discord notification sent successfully!"
+          else
+            echo "Failed to send Discord notification."
+          fi
